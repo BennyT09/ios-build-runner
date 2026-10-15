@@ -1,0 +1,85 @@
+name: Build Encrypted JARVIS Watch V2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout private JARVIS
+        uses: actions/checkout@v4
+        with:
+          repository: BennyT09/JARVIS
+          ref: jarvis-watch-v2
+          path: private-src
+          ssh-key: ${{ secrets.JARVIS_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Install tools
+        run: brew install xcodegen age
+
+      - name: Build iPhone IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd "$GITHUB_WORKSPACE/private-src"
+            git clone --depth 1 --branch b10982 https://github.com/ggml-org/llama.cpp.git vendor/llama.cpp
+            cd vendor/llama.cpp
+            ./build-xcframework.sh ios-sim ios-device
+
+            cd "$GITHUB_WORKSPACE/private-src/ios"
+            xcodegen generate
+
+            xcodebuild \
+              -project JARVIS.xcodeproj \
+              -scheme JARVIS \
+              -sdk iphoneos \
+              -configuration Debug \
+              -derivedDataPath build-device \
+              CODE_SIGNING_ALLOWED=NO \
+              JARVIS_GATEWAY_TOKEN= \
+              build
+
+            mkdir -p "$RUNNER_TEMP/ipa/Payload"
+            cp -R build-device/Build/Products/Debug-iphoneos/JARVIS.app "$RUNNER_TEMP/ipa/Payload/JARVIS.app"
+            cd "$RUNNER_TEMP/ipa"
+            zip -qr "$RUNNER_TEMP/JARVIS-unsigned.ipa" Payload
+          ) > "$RUNNER_TEMP/jarvis-build.log" 2>&1
+
+      - name: Encrypt outputs
+        if: always()
+        shell: bash
+        env:
+          IPA_RECIPIENT: ${{ vars.JARVIS_IPA_RECIPIENT }}
+        run: |
+          set -euo pipefail
+          mkdir -p encrypted
+          printf '%s\n' "$IPA_RECIPIENT" > "$RUNNER_TEMP/recipient.pub"
+
+          if [ -f "$RUNNER_TEMP/JARVIS-unsigned.ipa" ]; then
+            age -R "$RUNNER_TEMP/recipient.pub" \
+              -o encrypted/JARVIS-unsigned.ipa.age \
+              "$RUNNER_TEMP/JARVIS-unsigned.ipa"
+          fi
+
+          if [ -f "$RUNNER_TEMP/jarvis-build.log" ]; then
+            age -R "$RUNNER_TEMP/recipient.pub" \
+              -o encrypted/jarvis-build.log.age \
+              "$RUNNER_TEMP/jarvis-build.log"
+          fi
+
+      - name: Upload encrypted files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: JARVIS-encrypted
+          path: encrypted/*.age
+          if-no-files-found: error
+          retention-days: 7
